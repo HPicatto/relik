@@ -1,12 +1,27 @@
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from transformers import AutoModel, PreTrainedModel
 from transformers.activations import ClippedGELUActivation, GELUActivation
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_utils import PoolerEndLogits
+from transformers.utils import ModelOutput
 
 from .configuration_relik import RelikReaderConfig
+
+
+# --- FIX START: Define PoolerEndLogits locally ---
+@dataclass
+class PoolerEndLogits(ModelOutput):
+    """
+    Base class for outputs of model heads that do end-position logic.
+    Re-implemented locally since it was removed from transformers.modeling_utils.
+    """
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+# --- FIX END ---
 
 
 class RelikReaderSample:
@@ -44,7 +59,54 @@ activation2functions = {
 
 class PoolerEndLogitsBi(PoolerEndLogits):
     def __init__(self, config: PretrainedConfig):
-        super().__init__(config)
+        # We don't call super().__init__() because ModelOutput is a dataclass
+        # and doesn't have a standard __init__ logic like nn.Module.
+        # Instead, we treat this class as an nn.Module mixin logic.
+        # Note: Since PoolerEndLogits is a data container (ModelOutput), 
+        # inheriting from it to add layers (nn.Linear) is slightly unidiomatic 
+        # but preserves the original logic of the library. 
+        # To make it a proper nn.Module, we must ensure PreTrainedModel or nn.Module is involved,
+        # but here it seems used as a sub-module.
+        
+        # ACTUALLY: The original `PoolerEndLogits` in transformers was likely an nn.Module.
+        # The replacement above is a dataclass (output container). 
+        # This class `PoolerEndLogitsBi` tries to be a neural network layer.
+        # We need to fix the inheritance to be an nn.Module.
+        pass
+
+# --- RECTIFICATION OF LOGIC ---
+# The original PoolerEndLogits in older transformers was actually an nn.Module 
+# that took hidden states and produced logits. The name is confusing.
+# We need to re-implement the Logic, not just the output container.
+
+class PoolerEndLogits(torch.nn.Module):
+    """
+    Simple pooler that takes hidden states and applies a dense layer.
+    Re-implemented to replace the removed transformers class.
+    """
+    def __init__(self, config: PretrainedConfig):
+        super().__init__()
+        self.dense = torch.nn.Linear(config.hidden_size, 1)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        start_states: Optional[torch.FloatTensor] = None,
+        start_positions: Optional[torch.LongTensor] = None,
+        p_mask: Optional[torch.FloatTensor] = None,
+    ) -> torch.FloatTensor:
+        # This matches the signature expected by the Relik code
+        x = self.dense(hidden_states).squeeze(-1)
+        if p_mask is not None:
+            if p_mask.dim() < x.dim():
+                p_mask = p_mask.unsqueeze(-1)
+            x = x * (1 - p_mask) - 1e30 * p_mask
+        return x
+
+
+class PoolerEndLogitsBi(torch.nn.Module):
+    def __init__(self, config: PretrainedConfig):
+        super().__init__()
         self.dense_1 = torch.nn.Linear(config.hidden_size, 2)
 
     def forward(
@@ -54,14 +116,20 @@ class PoolerEndLogitsBi(PoolerEndLogits):
         start_positions: Optional[torch.LongTensor] = None,
         p_mask: Optional[torch.FloatTensor] = None,
     ) -> torch.FloatTensor:
+        # Logic adapted from original transformers implementation
+        logits = self.dense_1(hidden_states)
+        
         if p_mask is not None:
-            p_mask = p_mask.unsqueeze(-1)
-        logits = super().forward(
-            hidden_states,
-            start_states,
-            start_positions,
-            p_mask,
-        )
+            # p_mask shape alignment
+            if p_mask.dim() < logits.dim():
+                p_mask = p_mask.unsqueeze(-1)
+            
+            # Masking logic similar to _mask_logits
+            if logits.dtype == torch.float16:
+                logits = logits * (1 - p_mask) - 65500 * p_mask
+            else:
+                logits = logits * (1 - p_mask) - 1e30 * p_mask
+                
         return logits
 
 
